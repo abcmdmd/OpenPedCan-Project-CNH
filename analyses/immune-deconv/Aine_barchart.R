@@ -86,6 +86,7 @@ mb_unique_samples <- unique(mb_2[c("Kids_First_Biospecimen_ID", "molecular_subty
 
 library(ggplot2)
 library(dplyr)
+library(tidyr)
 
 subtypes <- c("MB, WNT", "MB, SHH", "MB, Group3", "MB, Group4")
 
@@ -128,7 +129,70 @@ immune %>%
 # 3 MB, SHH               1
 # 4 MB, WNT               1
 
-# ============================ ACTUAL PLOTTING ============================ #
+# ------------------------- Statsig calculations ------------------------- #
+stat_tests <- immune_samples %>%
+  group_by(molecular_subtype, cell_type) %>%
+  summarise(mean_proportion = mean(proportion), .groups = "drop") %>%
+  pivot_wider(names_from = molecular_subtype, values_from = mean_proportion) %>%
+  mutate(
+    `MB, WNT vs MB, SHH` = `MB, WNT` - `MB, SHH`,
+    `MB, WNT vs MB, Group3` = `MB, WNT` - `MB, Group3`,
+    `MB, WNT vs MB, Group4` = `MB, WNT` - `MB, Group4`,
+    `MB, SHH vs MB, Group3` = `MB, SHH` - `MB, Group3`,
+    `MB, SHH vs MB, Group4` = `MB, SHH` - `MB, Group4`,
+    `MB, Group3 vs MB, Group4` = `MB, Group3` - `MB, Group4`
+  )
+
+mean_differences <- stat_tests %>%
+  select(cell_type, contains(" vs ")) %>%
+  pivot_longer(
+    cols = -cell_type,
+    names_to = "comparison",
+    values_to = "mean_difference"
+  )
+
+subtype_pairs <- list(
+  c("MB, WNT", "MB, SHH"),
+  c("MB, WNT", "MB, Group3"),
+  c("MB, WNT", "MB, Group4"),
+  c("MB, SHH", "MB, Group3"),
+  c("MB, SHH", "MB, Group4"),
+  c("MB, Group3", "MB, Group4")
+)
+
+# adding benjamini for multiple testing
+pairwise <- immune_samples %>%
+  group_by(cell_type) %>%
+  group_modify(~ {
+    bind_rows(lapply(subtype_pairs, function(pair) {
+      a <- .x$proportion[.x$molecular_subtype == pair[1]]
+      b <- .x$proportion[.x$molecular_subtype == pair[2]]
+      p <- if (length(unique(c(a, b))) < 2) {
+      NA_real_
+      } else {
+      wilcox.test(a, b, exact = FALSE)$p.value
+      }
+
+      tibble(
+        comparison = paste(pair, collapse = " vs "),
+        p_value = p
+      )
+    }))
+  }) %>%
+  ungroup() %>%
+  mutate(
+    p_adjusted_BH = p.adjust(p_value, method = "BH"),
+    significant = p_adjusted_BH < 0.05
+  )
+
+stat_results <- mean_differences %>%
+  left_join(pairwise,by = c("cell_type", "comparison")) 
+
+print(stat_results, n = Inf)
+
+write.table(stat_results, file = "analyses/immune-deconv/results/Aine_MB_pairwise_tests.tsv",  sep = "\t", row.names = FALSE, quote = FALSE)
+
+# ============================ ACTUAL PLOTTING ============================ #  
 immune$molecular_subtype <- factor(immune$molecular_subtype, levels = subtypes)
 
 sample_counts <- immune_samples %>%
@@ -155,3 +219,43 @@ print(plot)
 #dir.create("analyses/immune-deconv/aine_scratch/plots")
 #ggsave("analyses/immune-deconv/aine_scratch/plots/MB_immune_composition_quantiseq.png", plot = plot, width = 8, height = 6, dpi = 300)
 ggsave("analyses/immune-deconv/results/Aine_MB_immune_composition.png", plot = plot, width = 8, height = 6, dpi = 300)
+
+# ------------------------- plotting the statsig one ------------------------- #
+stats <- stat_results %>%
+  mutate(
+    comparison = factor(comparison, levels = c(
+      "MB, WNT vs MB, SHH",
+      "MB, WNT vs MB, Group3",
+      "MB, WNT vs MB, Group4",
+      "MB, SHH vs MB, Group3",
+      "MB, SHH vs MB, Group4",
+      "MB, Group3 vs MB, Group4"
+    )),
+    significance = case_when(
+      p_adjusted_BH > 0.05 ~ "ns",
+      p_adjusted_BH <= 0.05 & p_adjusted_BH > 0.01 ~ "<= 0.05",
+      p_adjusted_BH <= 0.01 & p_adjusted_BH > 0.001 ~ "<= 0.01",
+      p_adjusted_BH <= 0.001 ~ " <= 0.001"
+    ),
+    cell_type = factor(cell_type, levels = unique(immune$cell_type)),
+  )
+
+
+sigplot <- ggplot(stats, aes(x = comparison, y = cell_type)) +
+  geom_tile(aes(fill = significance), colour = "white") +
+  scale_fill_viridis_d(name = "Significance", drop = FALSE) +
+  scale_x_discrete(labels = c(
+    "MB, WNT vs MB, SHH" = "WNT vs SHH",
+    "MB, WNT vs MB, SHH" = "WNT vs SHH",
+    "MB, WNT vs MB, Group3" = "WNT vs Group 3",
+    "MB, WNT vs MB, Group4" = "WNT vs Group 4",
+    "MB, SHH vs MB, Group3" = "SHH vs Group 3",
+    "MB, SHH vs MB, Group4" = "SHH vs Group 4",
+    "MB, Group3 vs MB, Group4" = "Group 3 vs Group 4")) +
+  labs(x= "MB Subtype Comparison", y = "Immune Cell Type", title = "Pairwise comparisons of immune cell composition by MB subtype") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 26, hjust = 1,size = 10))
+
+print(sigplot)
+
+ggsave("analyses/immune-deconv/results/Aine_MB_immune_composition_statsig.png", plot = sigplot, width = 8, height = 6, dpi = 300)
